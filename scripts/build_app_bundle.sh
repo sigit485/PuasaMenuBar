@@ -53,6 +53,8 @@ cat > "${APP_BUNDLE_PATH}/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>PuasaMenuBar membutuhkan lokasi untuk mengisi kota dan negara secara otomatis.</string>
 </dict>
 </plist>
 PLIST

@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import CoreLocation
 import SwiftUI
 
 struct PrayerTimes {
@@ -345,6 +346,190 @@ private enum AladhanAPI {
     }
 }
 
+private struct DetectedLocation {
+    let city: String
+    let country: String
+}
+
+private final class LocationResolver: NSObject {
+    enum ResolverError: LocalizedError {
+        case missingUsageDescription
+        case servicesDisabled
+        case permissionDenied
+        case requestInProgress
+        case unableToResolveAddress
+        case timeout
+
+        var errorDescription: String? {
+            switch self {
+            case .missingUsageDescription:
+                return "Izin lokasi belum aktif di konfigurasi app."
+            case .servicesDisabled:
+                return "Layanan lokasi nonaktif di perangkat."
+            case .permissionDenied:
+                return "Izin lokasi ditolak. Aktifkan di System Settings > Privacy & Security > Location Services."
+            case .requestInProgress:
+                return "Deteksi lokasi sedang berjalan."
+            case .unableToResolveAddress:
+                return "Gagal membaca kota/negara dari lokasi saat ini."
+            case .timeout:
+                return "Deteksi lokasi timeout. Coba lagi."
+            }
+        }
+    }
+
+    private let manager = CLLocationManager()
+    private let geocoder = CLGeocoder()
+    private var continuation: CheckedContinuation<DetectedLocation, Error>?
+    private var timeoutTask: Task<Void, Never>?
+
+    @MainActor
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyKilometer
+    }
+
+    @MainActor
+    func detect() async throws -> DetectedLocation {
+        guard Bundle.main.object(forInfoDictionaryKey: "NSLocationWhenInUseUsageDescription") != nil else {
+            throw ResolverError.missingUsageDescription
+        }
+
+        guard CLLocationManager.locationServicesEnabled() else {
+            throw ResolverError.servicesDisabled
+        }
+
+        guard continuation == nil else {
+            throw ResolverError.requestInProgress
+        }
+
+        let status = manager.authorizationStatus
+        if status == .denied || status == .restricted {
+            throw ResolverError.permissionDenied
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            self.startTimeout()
+            self.requestLocation(for: status)
+        }
+    }
+
+    @MainActor
+    private func requestLocation(for status: CLAuthorizationStatus) {
+        switch status {
+        case .notDetermined:
+            manager.requestWhenInUseAuthorization()
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.requestLocation()
+        case .denied, .restricted:
+            finish(with: .failure(ResolverError.permissionDenied))
+        @unknown default:
+            finish(with: .failure(ResolverError.permissionDenied))
+        }
+    }
+
+    @MainActor
+    private func startTimeout() {
+        timeoutTask?.cancel()
+        timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            self?.finish(with: .failure(ResolverError.timeout))
+        }
+    }
+
+    @MainActor
+    private func finish(with result: Result<DetectedLocation, Error>) {
+        timeoutTask?.cancel()
+        timeoutTask = nil
+
+        guard let continuation else {
+            return
+        }
+        self.continuation = nil
+
+        switch result {
+        case let .success(location):
+            continuation.resume(returning: location)
+        case let .failure(error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
+@MainActor
+extension LocationResolver: @preconcurrency CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.requestLocation()
+        case .denied, .restricted:
+            finish(with: .failure(LocationResolver.ResolverError.permissionDenied))
+        case .notDetermined:
+            break
+        @unknown default:
+            finish(with: .failure(LocationResolver.ResolverError.permissionDenied))
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        if let clError = error as? CLError, clError.code == .denied {
+            finish(with: .failure(LocationResolver.ResolverError.permissionDenied))
+            return
+        }
+
+        finish(with: .failure(error))
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last else {
+            finish(with: .failure(LocationResolver.ResolverError.unableToResolveAddress))
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                let placemarks = try await geocoder.reverseGeocodeLocation(
+                    location,
+                    preferredLocale: Locale(identifier: "en_US_POSIX")
+                )
+
+                guard let placemark = placemarks.first else {
+                    finish(with: .failure(LocationResolver.ResolverError.unableToResolveAddress))
+                    return
+                }
+
+                let city = placemark.locality ?? placemark.subAdministrativeArea ?? placemark.administrativeArea
+                let country = placemark.country
+
+                guard let city,
+                      let country
+                else {
+                    finish(with: .failure(LocationResolver.ResolverError.unableToResolveAddress))
+                    return
+                }
+
+                let trimmedCity = city.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmedCountry = country.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                guard !trimmedCity.isEmpty, !trimmedCountry.isEmpty else {
+                    finish(with: .failure(LocationResolver.ResolverError.unableToResolveAddress))
+                    return
+                }
+
+                finish(with: .success(DetectedLocation(city: trimmedCity, country: trimmedCountry)))
+            } catch {
+                finish(with: .failure(error))
+            }
+        }
+    }
+}
+
 @MainActor
 final class PuasaViewModel: ObservableObject {
     enum PrayerSlot {
@@ -364,6 +549,7 @@ final class PuasaViewModel: ObservableObject {
     @Published private(set) var prayerTimes: PrayerTimes?
     @Published private(set) var tomorrowImsak: Date?
     @Published private(set) var isLoading = false
+    @Published private(set) var isDetectingLocation = false
     @Published private(set) var errorMessage: String?
 
     @Published var cityInput: String
@@ -373,6 +559,7 @@ final class PuasaViewModel: ObservableObject {
     private var settings: AppSettings
     private var tickerTask: Task<Void, Never>?
     private var lastFetchDayKey: String?
+    private let locationResolver = LocationResolver()
     private let deviceClockFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale.autoupdatingCurrent
@@ -513,7 +700,7 @@ final class PuasaViewModel: ObservableObject {
     var saveButtonEnabled: Bool {
         let city = cityInput.trimmingCharacters(in: .whitespacesAndNewlines)
         let country = countryInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !city.isEmpty && !country.isEmpty && !isLoading
+        return !city.isEmpty && !country.isEmpty && !isLoading && !isDetectingLocation
     }
 
     func refresh() {
@@ -540,6 +727,16 @@ final class PuasaViewModel: ObservableObject {
 
         Task {
             await refreshFromAPI(force: true)
+        }
+    }
+
+    func detectLocation() {
+        guard !isDetectingLocation else {
+            return
+        }
+
+        Task {
+            await detectLocationFromDevice()
         }
     }
 
@@ -716,6 +913,22 @@ final class PuasaViewModel: ObservableObject {
         return calendar.date(byAdding: .day, value: 1, to: prayerTimes.gregorianDate) ?? prayerTimes.gregorianDate.addingTimeInterval(24 * 3600)
     }
 
+    private func detectLocationFromDevice() async {
+        isDetectingLocation = true
+        errorMessage = nil
+        defer { isDetectingLocation = false }
+
+        do {
+            let location = try await locationResolver.detect()
+            cityInput = location.city
+            countryInput = location.country
+        } catch let resolverError as LocationResolver.ResolverError {
+            errorMessage = resolverError.localizedDescription
+        } catch {
+            errorMessage = "Gagal mendeteksi lokasi otomatis. Coba lagi."
+        }
+    }
+
     private static func loadSettings() -> AppSettings {
         guard let data = UserDefaults.standard.data(forKey: StorageKey.settings) else {
             return .default
@@ -759,7 +972,6 @@ private struct PuasaPopover: View {
 
     @ObservedObject var viewModel: PuasaViewModel
     @State private var isSettingsExpanded = false
-    @State private var isEditingSettings = false
     @FocusState private var focusedSettingField: SettingFocusField?
 
     var body: some View {
@@ -937,162 +1149,146 @@ private struct PuasaPopover: View {
                 }
 
                 if isSettingsExpanded {
-                    if !isEditingSettings {
-                        HStack {
-                            Button("Edit") {
-                                isEditingSettings = true
-                                DispatchQueue.main.async {
-                                    focusedSettingField = .city
+                    HStack {
+                        Button {
+                            focusedSettingField = nil
+                            NSApp.keyWindow?.makeFirstResponder(nil)
+                            viewModel.detectLocation()
+                        } label: {
+                            HStack(spacing: 6) {
+                                if viewModel.isDetectingLocation {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(Color(red: 0.13, green: 0.55, blue: 0.44))
+                                } else {
+                                    Image(systemName: "location.fill")
+                                        .font(.system(size: 11, weight: .semibold))
                                 }
+
+                                Text(viewModel.isDetectingLocation ? "Mendeteksi lokasi..." : "Auto-Detect Lokasi")
+                                    .lineLimit(1)
                             }
-                            .buttonStyle(.plain)
                             .font(.system(size: 11, weight: .semibold, design: .rounded))
                             .foregroundStyle(Color(red: 0.13, green: 0.55, blue: 0.44))
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
+                            .padding(.vertical, 5)
                             .background(
                                 Capsule()
                                     .fill(Color(red: 0.87, green: 0.96, blue: 0.93))
                             )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.isDetectingLocation)
 
-                            Spacer()
+                        Spacer()
+                    }
+
+                    SettingLine(label: "Kota") {
+                        SettingInputShell {
+                            TextField("Surabaya", text: $viewModel.cityInput)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 14, weight: .medium, design: .rounded))
+                                .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
+                                .focused($focusedSettingField, equals: .city)
                         }
                     }
 
-                    if isEditingSettings {
-                        SettingLine(label: "Kota") {
-                            SettingInputShell {
-                                TextField("Surabaya", text: $viewModel.cityInput)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                                    .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
-                                    .focused($focusedSettingField, equals: .city)
-                            }
+                    SettingLine(label: "Negara") {
+                        SettingInputShell {
+                            TextField("Indonesia", text: $viewModel.countryInput)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 14, weight: .medium, design: .rounded))
+                                .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
+                                .focused($focusedSettingField, equals: .country)
                         }
+                    }
 
-                        SettingLine(label: "Negara") {
-                            SettingInputShell {
-                                TextField("Indonesia", text: $viewModel.countryInput)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                                    .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
-                                    .focused($focusedSettingField, equals: .country)
-                            }
-                        }
-
-                        SettingLine(label: "Metode") {
-                            SettingInputShell {
-                                Menu {
-                                    ForEach(PrayerMethod.allCases) { method in
-                                        Button {
-                                            viewModel.methodInput = method
-                                        } label: {
-                                            if method == viewModel.methodInput {
-                                                Label(method.title, systemImage: "checkmark")
-                                            } else {
-                                                Text(method.title)
-                                            }
+                    SettingLine(label: "Metode") {
+                        SettingInputShell {
+                            Menu {
+                                ForEach(PrayerMethod.allCases) { method in
+                                    Button {
+                                        viewModel.methodInput = method
+                                    } label: {
+                                        if method == viewModel.methodInput {
+                                            Label(method.title, systemImage: "checkmark")
+                                        } else {
+                                            Text(method.title)
                                         }
                                     }
-                                } label: {
-                                    HStack(spacing: 8) {
-                                        Text(viewModel.methodInput.title)
-                                            .lineLimit(1)
-                                        Spacer(minLength: 8)
-                                        Image(systemName: "chevron.up.chevron.down")
-                                            .font(.system(size: 10, weight: .semibold))
-                                    }
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
                                 }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        if let errorMessage = viewModel.errorMessage {
-                            Text(errorMessage)
-                                .font(.system(size: 11, weight: .regular, design: .rounded))
-                                .foregroundStyle(Color.red.opacity(0.88))
-                                .padding(.top, 2)
-                        }
-
-                        HStack {
-                            Button("Batal") {
-                                closeSettingsEditor(discardChanges: true)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Text(viewModel.methodInput.title)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.up.chevron.down")
+                                        .font(.system(size: 10, weight: .semibold))
+                                }
+                                .font(.system(size: 14, weight: .medium, design: .rounded))
+                                .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
                             }
                             .buttonStyle(.plain)
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundStyle(Color(red: 0.18, green: 0.41, blue: 0.35))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule()
-                                    .fill(Color(red: 0.89, green: 0.95, blue: 0.92))
-                            )
-
-                            Button("Simpan Perubahan") {
-                                viewModel.saveSettings()
-                                closeSettingsEditor(discardChanges: false)
-                                isSettingsExpanded = false
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule()
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [
-                                                Color(red: 0.17, green: 0.60, blue: 0.48),
-                                                Color(red: 0.24, green: 0.68, blue: 0.55),
-                                            ],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
-                                    )
-                            )
-                            .opacity(viewModel.saveButtonEnabled ? 1 : 0.45)
-                            .disabled(!viewModel.saveButtonEnabled)
-
-                            Spacer()
-
-                            if viewModel.isLoading {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .tint(Color(red: 0.19, green: 0.58, blue: 0.48))
-                            }
-                        }
-                        .padding(.top, 4)
-                    } else {
-                        SettingLine(label: "Kota") {
-                            SettingInputShell {
-                                Text(viewModel.cityInput)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                            }
-                        }
-
-                        SettingLine(label: "Negara") {
-                            SettingInputShell {
-                                Text(viewModel.countryInput)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                            }
-                        }
-
-                        SettingLine(label: "Metode") {
-                            SettingInputShell {
-                                Text(viewModel.methodInput.title)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                                    .lineLimit(1)
-                            }
                         }
                     }
+
+                    if let errorMessage = viewModel.errorMessage {
+                        Text(errorMessage)
+                            .font(.system(size: 11, weight: .regular, design: .rounded))
+                            .foregroundStyle(Color.red.opacity(0.88))
+                            .padding(.top, 2)
+                    }
+
+                    HStack {
+                        Button("Batal") {
+                            closeSettingsEditor(discardChanges: true, collapse: true)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color(red: 0.18, green: 0.41, blue: 0.35))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(Color(red: 0.89, green: 0.95, blue: 0.92))
+                        )
+
+                        Button("Simpan Perubahan") {
+                            viewModel.saveSettings()
+                            closeSettingsEditor(discardChanges: false, collapse: true)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [
+                                            Color(red: 0.17, green: 0.60, blue: 0.48),
+                                            Color(red: 0.24, green: 0.68, blue: 0.55),
+                                        ],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                        )
+                        .opacity(viewModel.saveButtonEnabled ? 1 : 0.45)
+                        .disabled(!viewModel.saveButtonEnabled)
+
+                        Spacer()
+
+                        if viewModel.isLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(Color(red: 0.19, green: 0.58, blue: 0.48))
+                        }
+                    }
+                    .padding(.top, 4)
                 }
             }
             .animation(.easeInOut(duration: 0.18), value: isSettingsExpanded)
@@ -1119,20 +1315,22 @@ private struct PuasaPopover: View {
         }
     }
 
-    private func closeSettingsEditor(discardChanges: Bool) {
+    private func closeSettingsEditor(discardChanges: Bool, collapse: Bool) {
         if discardChanges {
             viewModel.discardInputChanges()
         }
         focusedSettingField = nil
         NSApp.keyWindow?.makeFirstResponder(nil)
-        isEditingSettings = false
+        if collapse {
+            isSettingsExpanded = false
+        }
     }
 
     private func toggleSettingsExpansion() {
         if isSettingsExpanded {
             focusedSettingField = nil
             NSApp.keyWindow?.makeFirstResponder(nil)
-            isEditingSettings = false
+            viewModel.discardInputChanges()
         }
         isSettingsExpanded.toggle()
     }
