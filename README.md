@@ -12,7 +12,9 @@
 
 ## App Preview
 
-![PuasaMenuBar Screenshot](docs/images/app-screenshot.svg)
+<p align="center">
+  <img src="SS%20App.png" alt="PuasaMenuBar Screenshot" width="420" />
+</p>
 
 ## Highlights
 
