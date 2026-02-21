@@ -1,8 +1,18 @@
 # PuasaMenuBar
 
-A modern macOS menu bar app for daily fasting prayer schedule tracking.
+<p align="center">
+  <img src="docs/images/app-icon.svg" alt="PuasaMenuBar App Icon" width="132" />
+</p>
+
+<p align="center">
+  <b>A modern macOS menu bar app for daily fasting prayer schedule tracking.</b>
+</p>
 
 `PuasaMenuBar` menampilkan jadwal `Imsak`, `Subuh`, dan `Maghrib` langsung dari menu bar macOS, dengan UI hijau modern dan pengaturan lokasi/metode perhitungan.
+
+## App Preview
+
+![PuasaMenuBar Screenshot](docs/images/app-screenshot.svg)
 
 ## Highlights
 
