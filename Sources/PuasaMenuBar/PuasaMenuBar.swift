@@ -543,6 +543,13 @@ final class PuasaViewModel: ObservableObject {
         }
     }
 
+    func discardInputChanges() {
+        cityInput = settings.city
+        countryInput = settings.country
+        methodInput = settings.method
+        errorMessage = nil
+    }
+
     private var displayTimeZone: TimeZone {
         prayerTimes?.timeZone ?? TimeZone.current
     }
@@ -745,7 +752,15 @@ struct PuasaMenuBarApp: App {
 }
 
 private struct PuasaPopover: View {
+    private enum SettingFocusField: Hashable {
+        case city
+        case country
+    }
+
     @ObservedObject var viewModel: PuasaViewModel
+    @State private var isSettingsExpanded = false
+    @State private var isEditingSettings = false
+    @FocusState private var focusedSettingField: SettingFocusField?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -898,101 +913,189 @@ private struct PuasaPopover: View {
     private var settingsCard: some View {
         WhiteCard {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Pengaturan")
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Color(red: 0.17, green: 0.38, blue: 0.33))
-
-                SettingLine(label: "Kota") {
-                    SettingInputShell {
-                        TextField("Surabaya", text: $viewModel.cityInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14, weight: .medium, design: .rounded))
-                            .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                            .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
-                    }
-                }
-
-                SettingLine(label: "Negara") {
-                    SettingInputShell {
-                        TextField("Indonesia", text: $viewModel.countryInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14, weight: .medium, design: .rounded))
-                            .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                            .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
-                    }
-                }
-
-                SettingLine(label: "Metode") {
-                    SettingInputShell {
-                        Menu {
-                            ForEach(PrayerMethod.allCases) { method in
-                                Button {
-                                    viewModel.methodInput = method
-                                } label: {
-                                    if method == viewModel.methodInput {
-                                        Label(method.title, systemImage: "checkmark")
-                                    } else {
-                                        Text(method.title)
-                                    }
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 8) {
-                                Text(viewModel.methodInput.title)
-                                    .lineLimit(1)
-                                Spacer(minLength: 8)
-                                Image(systemName: "chevron.up.chevron.down")
-                                    .font(.system(size: 10, weight: .semibold))
-                            }
-                            .font(.system(size: 14, weight: .medium, design: .rounded))
-                            .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                if let errorMessage = viewModel.errorMessage {
-                    Text(errorMessage)
-                        .font(.system(size: 11, weight: .regular, design: .rounded))
-                        .foregroundStyle(Color.red.opacity(0.88))
-                        .padding(.top, 2)
-                }
-
                 HStack {
-                    Button("Simpan Perubahan") {
-                        viewModel.saveSettings()
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.17, green: 0.60, blue: 0.48),
-                                        Color(red: 0.24, green: 0.68, blue: 0.55),
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                    )
-                    .opacity(viewModel.saveButtonEnabled ? 1 : 0.45)
-                    .disabled(!viewModel.saveButtonEnabled)
+                    Text("Pengaturan")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color(red: 0.17, green: 0.38, blue: 0.33))
 
                     Spacer()
 
-                    if viewModel.isLoading {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(Color(red: 0.19, green: 0.58, blue: 0.48))
+                    if !isSettingsExpanded {
+                        Text("Buka")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color(red: 0.32, green: 0.53, blue: 0.48))
+                    }
+
+                    Button {
+                        toggleSettingsExpansion()
+                    } label: {
+                        Image(systemName: isSettingsExpanded ? "chevron.up.circle.fill" : "chevron.down.circle.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color(red: 0.19, green: 0.58, blue: 0.48))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if isSettingsExpanded {
+                    if !isEditingSettings {
+                        HStack {
+                            Button("Edit") {
+                                isEditingSettings = true
+                                DispatchQueue.main.async {
+                                    focusedSettingField = .city
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color(red: 0.13, green: 0.55, blue: 0.44))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .fill(Color(red: 0.87, green: 0.96, blue: 0.93))
+                            )
+
+                            Spacer()
+                        }
+                    }
+
+                    if isEditingSettings {
+                        SettingLine(label: "Kota") {
+                            SettingInputShell {
+                                TextField("Surabaya", text: $viewModel.cityInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                    .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
+                                    .focused($focusedSettingField, equals: .city)
+                            }
+                        }
+
+                        SettingLine(label: "Negara") {
+                            SettingInputShell {
+                                TextField("Indonesia", text: $viewModel.countryInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                    .tint(Color(red: 0.16, green: 0.53, blue: 0.43))
+                                    .focused($focusedSettingField, equals: .country)
+                            }
+                        }
+
+                        SettingLine(label: "Metode") {
+                            SettingInputShell {
+                                Menu {
+                                    ForEach(PrayerMethod.allCases) { method in
+                                        Button {
+                                            viewModel.methodInput = method
+                                        } label: {
+                                            if method == viewModel.methodInput {
+                                                Label(method.title, systemImage: "checkmark")
+                                            } else {
+                                                Text(method.title)
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Text(viewModel.methodInput.title)
+                                            .lineLimit(1)
+                                        Spacer(minLength: 8)
+                                        Image(systemName: "chevron.up.chevron.down")
+                                            .font(.system(size: 10, weight: .semibold))
+                                    }
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        if let errorMessage = viewModel.errorMessage {
+                            Text(errorMessage)
+                                .font(.system(size: 11, weight: .regular, design: .rounded))
+                                .foregroundStyle(Color.red.opacity(0.88))
+                                .padding(.top, 2)
+                        }
+
+                        HStack {
+                            Button("Batal") {
+                                closeSettingsEditor(discardChanges: true)
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color(red: 0.18, green: 0.41, blue: 0.35))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(Color(red: 0.89, green: 0.95, blue: 0.92))
+                            )
+
+                            Button("Simpan Perubahan") {
+                                viewModel.saveSettings()
+                                closeSettingsEditor(discardChanges: false)
+                                isSettingsExpanded = false
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [
+                                                Color(red: 0.17, green: 0.60, blue: 0.48),
+                                                Color(red: 0.24, green: 0.68, blue: 0.55),
+                                            ],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                            )
+                            .opacity(viewModel.saveButtonEnabled ? 1 : 0.45)
+                            .disabled(!viewModel.saveButtonEnabled)
+
+                            Spacer()
+
+                            if viewModel.isLoading {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(Color(red: 0.19, green: 0.58, blue: 0.48))
+                            }
+                        }
+                        .padding(.top, 4)
+                    } else {
+                        SettingLine(label: "Kota") {
+                            SettingInputShell {
+                                Text(viewModel.cityInput)
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                            }
+                        }
+
+                        SettingLine(label: "Negara") {
+                            SettingInputShell {
+                                Text(viewModel.countryInput)
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                            }
+                        }
+
+                        SettingLine(label: "Metode") {
+                            SettingInputShell {
+                                Text(viewModel.methodInput.title)
+                                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color(red: 0.12, green: 0.28, blue: 0.24))
+                                    .lineLimit(1)
+                            }
+                        }
                     }
                 }
-                .padding(.top, 4)
             }
+            .animation(.easeInOut(duration: 0.18), value: isSettingsExpanded)
         }
     }
 
@@ -1014,6 +1117,24 @@ private struct PuasaPopover: View {
                 NSApplication.shared.terminate(nil)
             }
         }
+    }
+
+    private func closeSettingsEditor(discardChanges: Bool) {
+        if discardChanges {
+            viewModel.discardInputChanges()
+        }
+        focusedSettingField = nil
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        isEditingSettings = false
+    }
+
+    private func toggleSettingsExpansion() {
+        if isSettingsExpanded {
+            focusedSettingField = nil
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            isEditingSettings = false
+        }
+        isSettingsExpanded.toggle()
     }
 }
 
